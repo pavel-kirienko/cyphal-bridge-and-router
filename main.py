@@ -35,9 +35,8 @@ async def main() -> None:
 
 class Bridge:
     """
-    Each node has to subscribe to subjects on its own behalf to ensure that relevant traffic is delivered to it
+    Each transport has to subscribe to subjects on its own behalf to ensure that relevant traffic is delivered to it
     (e.g., in case of Cyphal/UDP it is necessary to publish IGMP announcements).
-    The nodes have to share the same node-ID on both sides.
     """
 
     EXTENT_BYTES = 1024**2
