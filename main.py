@@ -4,6 +4,7 @@ import asyncio
 import logging
 from typing import Callable
 import pycyphal  # type: ignore
+from pycyphal.presentation import Presentation  # type: ignore
 from pycyphal.transport import Transport, Capture, Tracer, TransferTrace, ErrorTrace  # type: ignore
 from pycyphal.transport import InputSessionSpecifier, InputSession, PayloadMetadata, TransferFrom  # type: ignore
 from pycyphal.transport import MessageDataSpecifier, ServiceDataSpecifier, SessionSpecifier  # type: ignore
@@ -12,22 +13,24 @@ import pycyphal.application  # type: ignore
 import uavcan.node.port
 
 
-def main() -> None:
-    node_info = pycyphal.application.NodeInfo(name="org.opencyphal.bridge")
+async def main() -> None:
+    logging.root.setLevel(logging.DEBUG)
+    try:
+        import coloredlogs  # type: ignore
+
+        # The level spec applies to the handler, not the root logger! This is different from basicConfig().
+        coloredlogs.install(level=logging.DEBUG, fmt=_LOG_FORMAT)
+    except Exception as ex:  # pylint: disable=broad-except
+        _logger.exception("Could not set up coloredlogs: %r", ex)  # pragma: no cover
+
     registry = pycyphal.application.make_registry("bridge.db")
-    uplink_node = pycyphal.application.make_node(node_info, registry)
-    dnlink_node = pycyphal.application.make_node(
-        node_info,
-        registry,
-        transport=_make_dnlink_transport(registry, uplink_node.id),
-    )
+    uplink = Presentation(pycyphal.application.make_transport(registry))
+    dnlink = Presentation(_make_dnlink_transport(registry))
+    _logger.info("UPLINK:   %s", uplink)
+    _logger.info("DOWNLINK: %s", dnlink)
+    _br = Bridge(uplink, dnlink, queue_capacity=int(registry.setdefault("bridge.queue_capacity", 1000)))
 
-    _br = Bridge(uplink_node, dnlink_node, queue_capacity=int(registry.setdefault("bridge.queue_capacity", 1000)))
-
-    uplink_node.start()
-    dnlink_node.start()
-
-    asyncio.run(asyncio.gather(*asyncio.all_tasks()))
+    await asyncio.sleep(1e100)
 
 
 class Bridge:
@@ -38,35 +41,27 @@ class Bridge:
     """
 
     EXTENT_BYTES = 1024**2
-    """The largest transfer this bridge is able to forward."""
+    """The maximum transfer size this bridge is able to forward."""
 
     MIN_OUTPUT_TIMEOUT = 1e-3
 
     MONOTONIC_TRANSFER_ID_MODULO_THRESHOLD = int(2**48)
 
-    def __init__(
-        self,
-        up_node: pycyphal.application.Node,
-        dn_node: pycyphal.application.Node,
-        queue_capacity: int,
-    ) -> None:
+    def __init__(self, up: Presentation, dn: Presentation, queue_capacity: int) -> None:
         loop = asyncio.get_event_loop()
-        up_tr = up_node.presentation.transport
-        dn_tr = dn_node.presentation.transport
-
-        up_tid_rect = self._make_transfer_id_rectifier(up_tr)
-        dn_tid_rect = self._make_transfer_id_rectifier(dn_tr)
+        up_tid_rect = self._make_transfer_id_rectifier(up.transport)
+        dn_tid_rect = self._make_transfer_id_rectifier(dn.transport)
 
         # Set up subject cross-linking based on the uavcan.node.port.List_0 announcements.
         # Note that we could trivially make these entries expire automatically:
         # just keep a timestamp and update it at every message reception.
-        subs_up: dict[int, InputSession] = {}
-        subs_dn: dict[int, InputSession] = {}
-        up_node.make_subscriber(uavcan.node.port.List_0).receive_in_background(
-            lambda msg, _meta: self._handle_uavcan_node_port_list(subs_dn, dn_node, msg)
+        sub_up: dict[int, InputSession] = {}
+        sub_dn: dict[int, InputSession] = {}
+        up.make_subscriber_with_fixed_subject_id(uavcan.node.port.List_0).receive_in_background(
+            lambda msg, _meta: self._handle_uavcan_node_port_list(sub_dn, dn.transport, msg)
         )
-        dn_node.make_subscriber(uavcan.node.port.List_0).receive_in_background(
-            lambda msg, _meta: self._handle_uavcan_node_port_list(subs_up, up_node, msg)
+        dn.make_subscriber_with_fixed_subject_id(uavcan.node.port.List_0).receive_in_background(
+            lambda msg, _meta: self._handle_uavcan_node_port_list(sub_up, up.transport, msg)
         )
 
         # The queues hold transfers in transit. They are filled by the snoopers and flushed by the spoofers.
@@ -74,84 +69,121 @@ class Bridge:
         dn2up_queue: asyncio.Queue[TransferTrace] = asyncio.Queue(queue_capacity)  # Filled from the downlink
         up2dn_queue: asyncio.Queue[TransferTrace] = asyncio.Queue(queue_capacity)  # Filled from the uplink
 
+        # Keep track of which nodes are available on each network segment.
+        # If we see the same node on both sides, we cease forwarding its traffic to avoid collisions.
+        up_nodes: set[int | None] = set()
+        dn_nodes: set[int | None] = set()
+
         # Set up transfer snoopers. They deliver all transfers to the queues.
-        up_tracer = up_tr.make_tracer()
-        dn_tracer = dn_tr.make_tracer()
-        up_tr.begin_capture(
+        up_tracer = up.transport.make_tracer()
+        dn_tracer = dn.transport.make_tracer()
+        up.transport.begin_capture(
             lambda cap: loop.call_soon_threadsafe(  # type: ignore
                 self._on_capture,
                 up_tracer,
                 up2dn_queue,
-                up_tid_rect(cap),
+                up_tid_rect,
+                cap,
             )
         )
-        dn_tr.begin_capture(
+        dn.transport.begin_capture(
             lambda cap: loop.call_soon_threadsafe(  # type: ignore
                 self._on_capture,
                 dn_tracer,
                 dn2up_queue,
-                dn_tid_rect(cap),
+                dn_tid_rect,
+                cap,
             )
         )
 
-        # Set up spoofing. These task consume data from the queues.
-        self._up_spoof = loop.create_task(self._run_spoofing(dn2up_queue, up_tr))
-        self._dn_spoof = loop.create_task(self._run_spoofing(up2dn_queue, dn_tr))
+        # Set up spoofing. These tasks consume data from the queues and update the set of nodes.
+        self._up_spoof = loop.create_task(
+            self._run_spoofing(
+                dn2up_queue,
+                dn_nodes,
+                up_nodes,
+                up.transport,
+            )
+        )
+        self._dn_spoof = loop.create_task(
+            self._run_spoofing(
+                up2dn_queue,
+                up_nodes,
+                dn_nodes,
+                dn.transport,
+            )
+        )
 
     def _handle_uavcan_node_port_list(
         self,
         subscriptions: dict[int, InputSession],
-        node: pycyphal.application.Node,
+        tr: Transport,
         msg: uavcan.node.port.List_0,
     ) -> None:
-        if msg.subscribers.mask:
+        if msg.subscribers.mask is not None:
             for subject_id, used in enumerate(msg.subscribers.mask):
                 if used:
-                    self._ensure_subscription(subscriptions, node, subject_id)
-        elif msg.subscribers.sparse_list:
+                    self._ensure_subscription(subscriptions, tr, subject_id)
+        elif msg.subscribers.sparse_list is not None:
             for subject_id_obj in msg.subscribers.sparse_list:
-                self._ensure_subscription(subscriptions, node, subject_id_obj.value)
-        elif msg.subscribers.total:
-            for subject_id in range(MessageDataSpecifier.SUBJECT_ID_MASK + 1):
-                self._ensure_subscription(subscriptions, node, subject_id)
+                self._ensure_subscription(subscriptions, tr, subject_id_obj.value)
+        elif msg.subscribers.total is not None:
+            _logger.debug("Total subscription ignored, assuming this is a diagnostic tool, not a real node")
         else:
             assert False
 
     @staticmethod
     def _ensure_subscription(
         subscriptions: dict[int, InputSession],
-        node: pycyphal.application.Node,
+        tr: Transport,
         subject_id: int,
     ) -> None:
         if subject_id in subscriptions:  # We could update the timestamp here to implement automatic expiration.
             return
-        # Create the subscription to ensure the lower layers of the network stack are configured to
+        # Create the input to ensure the lower layers of the network stack are configured to
         # receive the data we need (e.g., IGMP announcements are published, CAN acceptance filters configured, etc).
-        subscriptions[subject_id] = node.presentation.transport.get_input_session(
+        subscriptions[subject_id] = tr.get_input_session(
             InputSessionSpecifier(MessageDataSpecifier(subject_id), remote_node_id=None),
             PayloadMetadata(Bridge.EXTENT_BYTES),
         )
+        _logger.info("New subscription: %s", subscriptions[subject_id])
 
     @staticmethod
-    def _on_capture(tracer: Tracer, dst: asyncio.Queue[TransferTrace], cap: Capture) -> None:
+    def _on_capture(
+        tracer: Tracer,
+        dst: asyncio.Queue[TransferTrace],
+        tid_rect: Callable[[TransferTrace], TransferTrace],
+        cap: Capture,
+    ) -> None:
+        if _is_own_capture(cap):
+            # _logger.debug("Own capture dropped: %s", cap)
+            return
         res = tracer.update(cap)
-        if isinstance(res, TransferTrace):  # A reassembled transfer.
+        if res is None:  # No event.
+            pass
+        elif isinstance(res, TransferTrace):  # A reassembled transfer.
             try:
-                dst.put_nowait(res)
+                dst.put_nowait(tid_rect(res))
             except asyncio.QueueFull:
                 _logger.error("Queue full, transfer dropped: %s", res)
         elif isinstance(res, ErrorTrace):
-            _logger.warning("Transport-layer error: %s", res)
+            pass  # _logger.debug("Transport layer error: %s: %s", cap, res)
         else:
             _logger.debug("Unsupported transport event ignored: %s", res)
 
     @staticmethod
-    async def _run_spoofing(src: asyncio.Queue[TransferTrace], dst: Transport) -> None:
+    async def _run_spoofing(
+        src: asyncio.Queue[TransferTrace],
+        src_segment_nodes: set[int | None],
+        dst_segment_nodes: set[int | None],
+        dst: Transport,
+    ) -> None:
         loop = asyncio.get_event_loop()
         max_node_id = dst.protocol_parameters.max_nodes - 1
         while True:
             try:
                 item = await src.get()
+                src_segment_nodes.add(item.transfer.metadata.session_specifier.source_node_id)
                 if item.transfer.metadata.session_specifier.source_node_id is None:
                     _logger.debug(
                         "Anonymous transfer dropped because the target transport may not support it: %s", item
@@ -163,6 +195,24 @@ class Bridge:
                 ):
                     _logger.debug("Transfer not representable on the target network: %s", item)
                     continue
+                if item.transfer.metadata.session_specifier.source_node_id in dst_segment_nodes:
+                    _logger.debug(
+                        "Transfer dropped because a node with the same ID is present in the "
+                        "destination network segment: %s",
+                        item,
+                    )
+                    print(src_segment_nodes)
+                    continue
+                if (
+                    item.transfer.metadata.session_specifier.destination_node_id is not None
+                    and item.transfer.metadata.session_specifier.destination_node_id not in dst_segment_nodes
+                ):
+                    _logger.debug(
+                        "Transfer dropped because the destination node is not in the target segment: %r", item
+                    )
+                    continue
+                # NOTE: We could also check if there are subscribers for this transfer in the target segment,
+                # NOTE: but doing so is likely to cause unexpected side effects for many applications.
                 # Heuristic: transfer-ID timeout is a sensible approximation of the optimal transmission timeout.
                 deadline = loop.time() + max(Bridge.MIN_OUTPUT_TIMEOUT, item.transfer_id_timeout)
                 # Note that if the transfer-ID of the target transport is cyclic,
@@ -171,6 +221,8 @@ class Bridge:
                 result = await dst.spoof(item.transfer, deadline)
                 if not result:
                     _logger.error("Transfer has timed out at output: %s", item)
+                else:
+                    pass  # _logger.debug("FWD: %s", item)
             except Exception as ex:
                 _logger.exception("Spoofing loop error: %s", ex)
                 await asyncio.sleep(1.0)
@@ -209,6 +261,27 @@ class Bridge:
         return lambda obj: obj
 
 
+def _is_own_capture(cap: Capture) -> bool:
+    """
+    True if this capture originates from the current process.
+    """
+    # FIXME this is a dirty hack; extract this into transport-specific logic.
+    from pycyphal.transport.can import CANCapture  # type: ignore
+    from pycyphal.transport.serial import SerialCapture  # type: ignore
+    from pycyphal.transport.udp import UDPCapture  # type: ignore
+    from pycyphal.transport.redundant import RedundantCapture  # type: ignore
+
+    if isinstance(cap, CANCapture):
+        return cap.own
+    if isinstance(cap, SerialCapture):
+        return cap.own
+    if isinstance(cap, UDPCapture):
+        raise NotImplementedError(f"TODO: compare the MAC address with one of the local ones?")
+    if isinstance(cap, RedundantCapture):
+        return _is_own_capture(cap.inferior)
+    assert False
+
+
 class TransferIDRectifier:
     """
     Unwraps cyclic transfer-IDs making them monotonic.
@@ -216,6 +289,11 @@ class TransferIDRectifier:
     Doing so requires keeping 64 bits per (port, node);
     for CAN, this requires (8192 + 512*2) * 128 nodes * 8 bytes = 9 MiB of RAM.
     Notice that the service-ID space is multiplied by two to account for requests and responses.
+
+    NOTE: This method works with service calls because it is guaranteed that the modulus of a rectified transfer
+    equals the original transfer-ID before rectification. This means that when a service response transfer is
+    forwarded back to the original network segment we will obtain the correct original response transfer-ID
+    expected by the caller.
     """
 
     _NUM_SUBJECTS = MessageDataSpecifier.SUBJECT_ID_MASK + 1
@@ -267,13 +345,11 @@ class TransferIDRectifier:
         return d
 
 
-def _make_dnlink_transport(
-    registry: pycyphal.application.register.Registry,
-    local_node_id: int,
-) -> pycyphal.transport.Transport:
+def _make_dnlink_transport(registry: pycyphal.application.register.Registry) -> pycyphal.transport.Transport:
+    # This is an approximation of pycyphal.application.make_transport().
     can_iface = str(registry.setdefault("bridge.downlink.can.iface", ""))
     if can_iface:
-        can_mtu = int(registry.setdefault("bridge.downlink.can.mtu", 8))
+        can_mtu = int(registry.setdefault("bridge.downlink.can.mtu", 64))
         if can_iface.startswith("socketcan:"):
             from pycyphal.transport.can.media.socketcan import SocketCANMedia  # type: ignore
 
@@ -282,12 +358,14 @@ def _make_dnlink_transport(
             raise RuntimeError(f"CAN media not supported (yet): {can_iface!r}")
         from pycyphal.transport.can import CANTransport  # type: ignore
 
-        return CANTransport(media, local_node_id=local_node_id)
+        return CANTransport(media, local_node_id=None)  # Anonymous as we don't really have a node of our own.
 
     raise RuntimeError(f"Downlink transport is not configured or not supported")
 
 
+_LOG_FORMAT = "%(asctime)s %(process)07d %(levelname)-3.3s %(name)s: %(message)s"
+logging.basicConfig(format=_LOG_FORMAT)
 _logger = logging.getLogger(__name__)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
