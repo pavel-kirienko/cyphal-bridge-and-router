@@ -47,6 +47,7 @@ coverage.xml
 *.log
 *.cache
 .scannerwork
+*.db
 
 # Compiled DSDL namespaces
 /uavcan/

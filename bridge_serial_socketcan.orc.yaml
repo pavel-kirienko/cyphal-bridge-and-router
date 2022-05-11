@@ -7,8 +7,8 @@ uavcan:
 $=:
 - ncat --broker --listen --source-port 50905
 
-- $=: ./main.py
+- $=: ./bridge.py
   bridge.downlink.can.iface: socketcan:vcan0
 
-- $=: ./main.py
+- $=: ./bridge.py
   bridge.downlink.can.iface: socketcan:vcan1

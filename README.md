@@ -1,4 +1,4 @@
-# Cyphal network bridge PoC
+# Cyphal network bridge & router PoC
 
 This is a visual aid for https://forum.opencyphal.org/t/cyphal-udp-routing-over-multiple-networks/1657/7?u=pavel.kirienko
 
@@ -6,7 +6,7 @@ Currently we are using Cyphal/serial instead of Cyphal/UDP because the bridge re
 and it is at this moment not yet implemented for `pycyphal.transport.udp.UDPTransport`.
 It makes no difference though.
 
-To evaluate:
+## Bridge evaluation
 
 1. Initialize `vcan0` and `vcan1` like:
   ```shell
@@ -24,7 +24,7 @@ To evaluate:
    - On `vcan0`: `y pub 1000:uavcan.primitive.scalar.integer64 '!$ n'`
    - On `vcan1`: `y sub 1000:uavcan.primitive.scalar.integer64`
 4. Observe that there is no traffic crossing the network segments as they are isolated.
-5. Run the orchestration file. It will launch two bridges: `vcan0 <-bridge-> serial <-bridge-> vcan1`.
+5. Run the bridge orchestration file. It will launch two bridges: `vcan0 <-bridge-> serial <-bridge-> vcan1`.
 6. Observe that the subscriber now sees the data from the publisher.
 7. Running a new instance of `y sub 1000` or `y pub 1000 whatever` will show that type discovery is also working.
 8. Run `y mon` to see the activity.
