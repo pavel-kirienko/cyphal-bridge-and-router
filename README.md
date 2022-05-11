@@ -6,7 +6,7 @@ Currently we are using Cyphal/serial instead of Cyphal/UDP because the bridge re
 and it is at this moment not yet implemented for `pycyphal.transport.udp.UDPTransport`.
 It makes no difference though.
 
-## Bridge evaluation
+## Preparation
 
 1. Initialize `vcan0` and `vcan1` like:
   ```shell
@@ -24,7 +24,18 @@ It makes no difference though.
    - On `vcan0`: `y pub 1000:uavcan.primitive.scalar.integer64 '!$ n'`
    - On `vcan1`: `y sub 1000:uavcan.primitive.scalar.integer64`
 4. Observe that there is no traffic crossing the network segments as they are isolated.
-5. Run the bridge orchestration file. It will launch two bridges: `vcan0 <-bridge-> serial <-bridge-> vcan1`.
-6. Observe that the subscriber now sees the data from the publisher.
-7. Running a new instance of `y sub 1000` or `y pub 1000 whatever` will show that type discovery is also working.
-8. Run `y mon` to see the activity.
+5. Run `y mon` in each network segment to see the activity.
+
+## Bridge evaluation
+
+1. Run `bridge_serial_socketcan.orc.yaml`. It will launch two bridges: `vcan0 <-bridge-> serial <-bridge-> vcan1`.
+2. Observe that the subscriber now sees the data from the publisher.
+3. Running a new instance of `y sub 1000` or `y pub 1000 whatever` will show that type discovery is also working.
+
+## Router evaluation
+
+1. Run `router_serial_socketcan.orc.yaml`. It will launch two routers: `vcan0 <-router-> serial <-router-> vcan1`.
+2. Observe that the subscriber now sees the data from the publisher as if it was published by the nearest bridge
+   (which is technically the case).
+3. Running a new instance of `y sub 1000` or `y pub 1000 whatever` will fail because the router does not have the
+   registers containing the type information, and service transfers are not routed.

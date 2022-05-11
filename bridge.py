@@ -11,6 +11,7 @@ from pycyphal.transport import MessageDataSpecifier, ServiceDataSpecifier, Sessi
 from pycyphal.transport import AlienTransfer, AlienTransferMetadata, AlienSessionSpecifier  # type: ignore
 import pycyphal.application  # type: ignore
 import uavcan.node.port
+from _common import make_dnlink_transport
 
 
 async def main() -> None:
@@ -25,7 +26,7 @@ async def main() -> None:
 
     registry = pycyphal.application.make_registry("bridge.db")
     uplink = Presentation(pycyphal.application.make_transport(registry))
-    dnlink = Presentation(_make_dnlink_transport(registry))
+    dnlink = Presentation(make_dnlink_transport(registry, "bridge"))
     _logger.info("UPLINK:   %s", uplink)
     _logger.info("DOWNLINK: %s", dnlink)
     _br = Bridge(uplink, dnlink, queue_capacity=int(registry.setdefault("bridge.queue_capacity", 1000)))
@@ -342,24 +343,6 @@ class TransferIDRectifier:
         assert 0 <= d < self._mod
         assert (a + d) & (self._mod - 1) == b
         return d
-
-
-def _make_dnlink_transport(registry: pycyphal.application.register.Registry) -> pycyphal.transport.Transport:
-    # This is an approximation of pycyphal.application.make_transport().
-    can_iface = str(registry.setdefault("bridge.downlink.can.iface", ""))
-    if can_iface:
-        can_mtu = int(registry.setdefault("bridge.downlink.can.mtu", 64))
-        if can_iface.startswith("socketcan:"):
-            from pycyphal.transport.can.media.socketcan import SocketCANMedia  # type: ignore
-
-            media = SocketCANMedia(can_iface.split(":", 1)[1], can_mtu)
-        else:
-            raise RuntimeError(f"CAN media not supported (yet): {can_iface!r}")
-        from pycyphal.transport.can import CANTransport  # type: ignore
-
-        return CANTransport(media, local_node_id=None)  # Anonymous as we don't really have a node of our own.
-
-    raise RuntimeError(f"Downlink transport is not configured or not supported")
 
 
 _LOG_FORMAT = "%(asctime)s %(process)07d %(levelname)-3.3s %(name)s: %(message)s"

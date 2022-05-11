@@ -1,0 +1,20 @@
+#!/usr/bin/env -S yakut --verbose orchestrate
+
+PYCYPHAL_LOGLEVEL: INFO
+uavcan:
+  serial.iface: socket://127.0.0.1:50905
+
+$=:
+- ?=: mkdir 0.tmp
+- ?=: mkdir 1.tmp
+-
+- ncat --broker --listen --source-port 50905
+
+# We have to run each in a separate directory because they have to use separate register files.
+- $=: cd 0.tmp; ../router.py
+  router.downlink.can.iface: socketcan:vcan0
+  uavcan.node.id: 10
+
+- $=: cd 1.tmp; ../router.py
+  router.downlink.can.iface: socketcan:vcan1
+  uavcan.node.id: 11
