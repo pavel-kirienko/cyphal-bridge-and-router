@@ -29,8 +29,12 @@ async def main() -> None:
     dnlink = Presentation(make_dnlink_transport(registry, "bridge"))
     _logger.info("UPLINK:   %s", uplink)
     _logger.info("DOWNLINK: %s", dnlink)
-    _br = Bridge(uplink, dnlink, queue_capacity=int(registry.setdefault("bridge.queue_capacity", 1000)))
-
+    _br = Bridge(
+        uplink,
+        dnlink,
+        queue_capacity=int(registry.setdefault("bridge.queue_capacity", 1000)),
+        node_id_mask=int(registry.setdefault("bridge.node_id_mask", pycyphal.application.register.Natural16([0]))),
+    )
     await asyncio.sleep(1e100)
 
 
@@ -47,7 +51,7 @@ class Bridge:
 
     MONOTONIC_TRANSFER_ID_MODULO_THRESHOLD = int(2**48)
 
-    def __init__(self, up: Presentation, dn: Presentation, queue_capacity: int) -> None:
+    def __init__(self, up: Presentation, dn: Presentation, queue_capacity: int, node_id_mask: int) -> None:
         loop = asyncio.get_event_loop()
         up_tid_rect = self._make_transfer_id_rectifier(up.transport)
         dn_tid_rect = self._make_transfer_id_rectifier(dn.transport)
@@ -83,6 +87,8 @@ class Bridge:
                 up_tracer,
                 up2dn_queue,
                 up_tid_rect,
+                up_nodes,
+                node_id_mask,
                 cap,
             )
         )
@@ -92,6 +98,8 @@ class Bridge:
                 dn_tracer,
                 dn2up_queue,
                 dn_tid_rect,
+                dn_nodes,
+                node_id_mask,
                 cap,
             )
         )
@@ -100,7 +108,6 @@ class Bridge:
         self._up_spoof = loop.create_task(
             self._run_spoofing(
                 dn2up_queue,
-                dn_nodes,
                 up_nodes,
                 up.transport,
             )
@@ -108,7 +115,6 @@ class Bridge:
         self._dn_spoof = loop.create_task(
             self._run_spoofing(
                 up2dn_queue,
-                up_nodes,
                 dn_nodes,
                 dn.transport,
             )
@@ -153,6 +159,8 @@ class Bridge:
         tracer: Tracer,
         dst: asyncio.Queue[TransferTrace],
         tid_rect: Callable[[TransferTrace], TransferTrace],
+        src_segment_nodes: set[int | None],
+        node_id_mask: int,
         cap: Capture,
     ) -> None:
         if _is_own_capture(cap):
@@ -163,7 +171,31 @@ class Bridge:
             pass
         elif isinstance(res, TransferTrace):  # A reassembled transfer.
             try:
-                dst.put_nowait(tid_rect(res))
+                tr = tid_rect(res)
+                src_segment_nodes.add(tr.transfer.metadata.session_specifier.source_node_id)
+                tr = TransferTrace(
+                    timestamp=tr.timestamp,
+                    transfer=AlienTransfer(
+                        metadata=AlienTransferMetadata(
+                            priority=tr.transfer.metadata.priority,
+                            transfer_id=tr.transfer.metadata.transfer_id,
+                            session_specifier=AlienSessionSpecifier(
+                                source_node_id=_maybe_xor(
+                                    tr.transfer.metadata.session_specifier.source_node_id,
+                                    node_id_mask,
+                                ),
+                                destination_node_id=_maybe_xor(
+                                    tr.transfer.metadata.session_specifier.destination_node_id,
+                                    node_id_mask,
+                                ),
+                                data_specifier=tr.transfer.metadata.session_specifier.data_specifier,
+                            ),
+                        ),
+                        fragmented_payload=tr.transfer.fragmented_payload,
+                    ),
+                    transfer_id_timeout=tr.transfer_id_timeout,
+                )
+                dst.put_nowait(tr)
             except asyncio.QueueFull:
                 _logger.error("Queue full, transfer dropped: %s", res)
         elif isinstance(res, ErrorTrace):
@@ -174,7 +206,6 @@ class Bridge:
     @staticmethod
     async def _run_spoofing(
         src: asyncio.Queue[TransferTrace],
-        src_segment_nodes: set[int | None],
         dst_segment_nodes: set[int | None],
         dst: Transport,
     ) -> None:
@@ -183,7 +214,6 @@ class Bridge:
         while True:
             try:
                 item = await src.get()
-                src_segment_nodes.add(item.transfer.metadata.session_specifier.source_node_id)
                 if item.transfer.metadata.session_specifier.source_node_id is None:
                     _logger.debug(
                         "Anonymous transfer dropped because the target transport may not support it: %s", item
@@ -198,17 +228,21 @@ class Bridge:
                 if item.transfer.metadata.session_specifier.source_node_id in dst_segment_nodes:
                     _logger.debug(
                         "Transfer dropped because a node with the same ID is present in the "
-                        "destination network segment: %s",
+                        "destination network segment: %s. "
+                        "dst_segment_nodes=%s",
                         item,
+                        dst_segment_nodes,
                     )
-                    print(src_segment_nodes)
                     continue
                 if (
                     item.transfer.metadata.session_specifier.destination_node_id is not None
                     and item.transfer.metadata.session_specifier.destination_node_id not in dst_segment_nodes
                 ):
                     _logger.debug(
-                        "Transfer dropped because the destination node is not in the target segment: %r", item
+                        "Transfer dropped because the destination node is not in the target segment: %r; "
+                        "dst_segment_nodes=%s",
+                        item,
+                        dst_segment_nodes,
                     )
                     continue
                 # NOTE: We could also check if there are subscribers for this transfer in the target segment,
@@ -280,6 +314,10 @@ def _is_own_capture(cap: Capture) -> bool:
     if isinstance(cap, RedundantCapture):
         return _is_own_capture(cap.inferior)
     assert False
+
+
+def _maybe_xor(maybe_x: int | None, y: int) -> int | None:
+    return None if maybe_x is None else (maybe_x ^ y)
 
 
 class TransferIDRectifier:

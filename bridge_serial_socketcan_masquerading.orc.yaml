@@ -3,7 +3,6 @@
 PYCYPHAL_LOGLEVEL: INFO
 uavcan:
   serial.iface: socket://192.168.1.200:50905
-bridge.node_id_mask: 0  # Shared mask for all segments (can be arbitrary).
 
 $=:
 - ?=: mkdir 0.tmp
@@ -13,6 +12,8 @@ $=:
 
 - $=: cd 0.tmp; ../bridge.py
   bridge.downlink.can.iface: socketcan:vcan0
+  bridge.node_id_mask: 256  # Unique mask makes different CAN segments unable to communicate with each other.
 
 - $=: cd 1.tmp; ../bridge.py
   bridge.downlink.can.iface: socketcan:vcan1
+  bridge.node_id_mask: 512
