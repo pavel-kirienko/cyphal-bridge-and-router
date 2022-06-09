@@ -32,6 +32,15 @@ It makes no difference though.
 2. Observe that the subscriber now sees the data from the publisher.
 3. Running a new instance of `y sub 1000` or `y pub 1000 whatever` will show that type discovery is also working.
 
+## Bridge evaluation with structured address space (with masquerading)
+
+1. Run `bridge_serial_socketcan_masquerading.orc.yaml`. It will launch two bridges: `vcan0 <-bridge-> serial <-bridge-> vcan1`.
+2. Observe that the subscriber is still unable to see the data from the publisher because it is masked away.
+3. In a new terminal, source `env_serial.sh` and ensure that the mask is adequate (change the node-ID if necessary).
+4. Launch a monitor or a new subscriber, and observe that it is able to consume the data from the publisher.
+5. Running a new instance of `y sub 1000` or `y pub 1000 whatever` on the serial segment
+   will show that type discovery is also working.
+
 ## Router evaluation
 
 1. Run `router_serial_socketcan.orc.yaml`. It will launch two routers: `vcan0 <-router-> serial <-router-> vcan1`.
